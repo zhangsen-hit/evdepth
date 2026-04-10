@@ -1,0 +1,16 @@
+# Core Deep Learning
+torch==2.9.1+cu126  # PyTorch Lightning 2.6 要求 torch>=2.1
+torchvision==0.24.1+cu126  # 匹配 torch 版本
+pytorch-lightning==2.6.0  # 升级到 2.6.0 版本
+
+# Configuration Management
+omegaconf  # YAML配置转换和点号访问（保留，不依赖Hydra）
+# Data Handling
+h5py
+# Tensor Operations
+einops
+# Logging and Visualization
+wandb
+pandas
+plotly
+strenum
