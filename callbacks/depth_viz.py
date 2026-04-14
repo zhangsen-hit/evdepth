@@ -79,6 +79,7 @@ class DepthVizCallback(VizCallbackBase):
             if trainer.is_global_zero:
                 os.makedirs("check_input", exist_ok=True)
 
+    @rank_zero_only
     def on_train_batch_end(
             self,
             trainer,

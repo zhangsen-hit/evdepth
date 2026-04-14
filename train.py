@@ -15,8 +15,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import pytorch_lightning as pl
 import torch
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+import pytorch_lightning as pl
 import yaml
 from typing import Dict, Any
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -209,7 +211,14 @@ def main():
         print("[CUDA] CUDA 可用，使用 GPU 训练")
         gpus = config['hardware']['gpus']
         if isinstance(gpus, int):
-            if gpus >= 0:
+            if gpus == -1:
+                trainer_args['accelerator'] = 'gpu'
+                trainer_args['devices'] = 'auto'
+                num_gpus = torch.cuda.device_count()
+                if num_gpus > 1:
+                    trainer_args['strategy'] = 'ddp'
+                print(f"[CUDA] 使用全部 {num_gpus} 张 GPU")
+            elif gpus >= 0:
                 trainer_args['accelerator'] = 'gpu'
                 trainer_args['devices'] = [gpus]
         elif isinstance(gpus, list):

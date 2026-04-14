@@ -11,7 +11,7 @@
 # ----------------------------------------------------------------------------
 dataset:
   name: liosam
-  path: /home/zs/4T_disk/Research3/dataset
+  path: /home/zs/Research3/dataset/
   
   # 序列长度（可调）。12GB 显存建议 24；显存充足可改为 50 或 200
   sequence_length: 6
@@ -23,7 +23,7 @@ dataset:
   # 多场景划分：指定哪些场景用于训练、哪些用于验证
   # path 下应包含以场景名命名的子目录（如 00/, 01/, ...），每个子目录含 index.txt + npz
   # train_scenes: ["00","01","02"]
-  train_scenes: ["00","02","04"]
+  train_scenes: ["00","02","03","04","05","06","07","08","09"]
   val_scenes: ["01"]
   
   # 单场景回退：若不配置 train_scenes/val_scenes，则 path 下直接含 index.txt，
@@ -116,7 +116,7 @@ model:
       patch_size: 4
     stage:
       lstm:
-        cell_type: stlstm    # 'convlstm' or 'stlstm'
+        cell_type: convlstm    # 'convlstm' or 'stlstm'
         zigzag: true          # ST-LSTM cross-layer M routing (requires cell_type: stlstm)
         dws_conv: False
         dws_conv_only_hidden: True
@@ -157,13 +157,13 @@ training:
   max_epochs: 10
   max_steps: 400000
   learning_rate: 0.0002
-  weight_decay: 0
+  weight_decay: 0.0001
   gradient_clip_val: 1.0
   limit_train_batches: 1.0
   
   lr_scheduler:
     use: True
-    total_steps: 400000
+    total_steps: 80600
     pct_start: 0.005
     div_factor: 25
     final_div_factor: 10000

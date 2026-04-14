@@ -272,17 +272,17 @@ class Module(pl.LightningModule):
         log_dict = {f'{prefix}{k}': v for k, v in losses_dict.items()}
         self.log_dict(log_dict, on_step=True, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
-        # 将每一步的总 loss 写入本地文件，便于后处理/画曲线
-        try:
-            loss_scalar = float(total_loss.detach().cpu().item())
-            import os
-            os.makedirs("local_loss", exist_ok=True)
-            file_mode = "w" if step == 0 else "a"
-            with open(os.path.join("local_loss", "train_loss.txt"), file_mode) as f:
-                f.write(f"{step}\t{loss_scalar}\n")
-        except Exception:
-            # 日志失败不应中断训练
-            pass
+        # 将每一步的总 loss 写入本地文件，便于后处理/画曲线（仅 rank 0 写入，避免 DDP 多进程竞争）
+        if self.global_rank == 0:
+            try:
+                loss_scalar = float(total_loss.detach().cpu().item())
+                import os
+                os.makedirs("local_loss", exist_ok=True)
+                file_mode = "w" if step == 0 else "a"
+                with open(os.path.join("local_loss", "train_loss.txt"), file_mode) as f:
+                    f.write(f"{step}\t{loss_scalar}\n")
+            except Exception:
+                pass
         
         # Add to depth evaluator (at pred resolution)
         if self.train_depth_evaluator is not None:
