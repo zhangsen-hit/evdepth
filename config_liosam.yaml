@@ -14,7 +14,7 @@ dataset:
   path: /home/zs/Research3/dataset/
   
   # 序列长度（可调）。12GB 显存建议 24；显存充足可改为 50 或 200
-  sequence_length: 6
+  sequence_length: 30
   
   # 时间连续性：正常间隔约 5ms，允许 3ms 以内偏差 → [2ms, 8ms]
   frame_interval_sec: 0.005
@@ -23,8 +23,8 @@ dataset:
   # 多场景划分：指定哪些场景用于训练、哪些用于验证
   # path 下应包含以场景名命名的子目录（如 00/, 01/, ...），每个子目录含 index.txt + npz
   # train_scenes: ["00","01","02"]
-  train_scenes: ["00","02","03","04","05","06","07","08","09"]
-  val_scenes: ["01"]
+  train_scenes: ["00","01","02","03","05","06","07","08","09","10","11","12","13","14","15","16","17","22","23"]
+  val_scenes: ["04"]
   
   # 单场景回退：若不配置 train_scenes/val_scenes，则 path 下直接含 index.txt，
   # 按 train_ratio 比例划分 train/val
@@ -153,7 +153,7 @@ model:
 # 训练配置
 # ----------------------------------------------------------------------------
 training:
-  precision: 32
+  precision: "16-mixed"
   max_epochs: 10
   max_steps: 400000
   learning_rate: 0.0002
@@ -163,8 +163,8 @@ training:
   
   lr_scheduler:
     use: True
-    total_steps: 80600
-    pct_start: 0.005
+    total_steps: 43000
+    pct_start: 0.1
     div_factor: 25
     final_div_factor: 10000
 

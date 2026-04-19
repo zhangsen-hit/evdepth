@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-torch.multiprocessing.set_sharing_strategy('file_system')
 
 import pytorch_lightning as pl
 import yaml

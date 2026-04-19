@@ -49,6 +49,10 @@ def load_val_delta1():
     return _load_xy(os.path.join(LOCAL_DIR, "val_delta1.txt"))
 
 
+def load_train_lr():
+    return _load_xy(os.path.join(LOCAL_DIR, "train_lr.txt"))
+
+
 def _plot_curve(steps, vals, ylabel, title, filename):
     if steps is None or vals is None:
         return
@@ -56,7 +60,7 @@ def _plot_curve(steps, vals, ylabel, title, filename):
         os.makedirs(OUT_DIR, exist_ok=True)
     plt.figure(figsize=(8, 4))
     plt.plot(steps, vals, linewidth=1.0)
-    plt.xlabel("global step")
+    plt.xlabel("epoch")
     plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(True, linestyle="--", alpha=0.4)
@@ -69,16 +73,19 @@ def _plot_curve(steps, vals, ylabel, title, filename):
 def plot_all():
     # 1) 训练 loss
     s, v = load_train_loss()
-    _plot_curve(s, v, "loss", "Train loss vs. global step", "train_loss_curve.png")
+    _plot_curve(s, v, "loss", "Train loss vs. epoch", "train_loss_curve.png")
     # 2) 训练 delta1
     s, v = load_train_delta1()
-    _plot_curve(s, v, "delta1", "Train δ1 vs. global step", "train_delta1_curve.png")
+    _plot_curve(s, v, "delta1", "Train δ1 vs. epoch", "train_delta1_curve.png")
     # 3) 验证 loss（这里用 rmse 作为验证 loss）
     s, v = load_val_loss()
-    _plot_curve(s, v, "rmse", "Val loss (RMSE) vs. global step", "val_loss_curve.png")
+    _plot_curve(s, v, "rmse", "Val loss (RMSE) vs. epoch", "val_loss_curve.png")
     # 4) 验证 delta1
     s, v = load_val_delta1()
-    _plot_curve(s, v, "delta1", "Val δ1 vs. global step", "val_delta1_curve.png")
+    _plot_curve(s, v, "delta1", "Val δ1 vs. epoch", "val_delta1_curve.png")
+    # 5) 学习率
+    s, v = load_train_lr()
+    _plot_curve(s, v, "learning rate", "Learning rate vs. epoch", "train_lr_curve.png")
 
 
 def main():

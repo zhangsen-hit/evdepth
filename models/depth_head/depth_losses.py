@@ -235,8 +235,24 @@ class DepthLoss(nn.Module):
     #     return total_loss, losses_dict
 
     def forward(self, predictions, target, mask=None):
+        """
+        多尺度深度 loss（稀疏 GT 友好版本）。
+
+        关键原则（参考 Monodepth2）：不下采样稀疏 GT，而是把各尺度预测统一上采样到 GT
+        的原始分辨率，只在原始高分辨率 mask 的有效点上计算 loss。这样做的好处：
+        1) 不丢失本就稀疏的激光雷达有效点；
+        2) 不把“无效值”随下采样扩散到更大范围（否则近地面的无效区会越来越大，
+           与天空成片无效混淆，导致近地面被错估为远处并出现条纹状伪影）；
+        3) 低分辨率层也能受到原分辨率 GT 的高频精确监督。
+        """
         total_loss = torch.zeros((), device=target.device, dtype=target.dtype)
         losses_dict = {}
+
+        # GT 和 mask 固定在输入（高）分辨率，全程不下采样
+        target_hw = target.shape[-2:]
+        target_norm_log = torch.clamp(target, 0.0, 1.0)
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask.bool()
 
         for scale in self.scales:
             key = f'depth_{scale}'
@@ -245,32 +261,24 @@ class DepthLoss(nn.Module):
 
             pred = predictions[key]
 
-            target_scaled = F.interpolate(
-                target, size=pred.shape[-2:], mode='bilinear', align_corners=False
-            )
-
-            if mask is not None:
-                mask_scaled = F.interpolate(
-                    mask.float(), size=pred.shape[-2:], mode='nearest'
-                ).bool()
+            # 双线性上采样预测到 GT 的原始分辨率（不是把 GT 降到 pred 分辨率）
+            if pred.shape[-2:] != target_hw:
+                pred_up = F.interpolate(
+                    pred, size=target_hw, mode='bilinear', align_corners=False
+                )
             else:
-                mask_scaled = None
+                pred_up = pred
 
-            # ---- B 方案：pred/target 已经是 norm_log，loss 直接在该空间计算 ----
-            pred_norm_log = pred
-            target_norm_log = target_scaled
+            # pred/target 均已在 norm_log 空间，直接计算
+            pred_norm_log = torch.clamp(pred_up, 0.0, 1.0)
 
-            # 数值安全：强制落入 [0, 1]，避免 sigmoid 失配或 pad 数值干扰
-            pred_norm_log = torch.clamp(pred_norm_log, 0.0, 1.0)
-            target_norm_log = torch.clamp(target_norm_log, 0.0, 1.0)
-
-            silog = self.silog_loss(pred_norm_log, target_norm_log, mask_scaled)
-            grad = self.grad_loss(pred_norm_log, target_norm_log, mask_scaled)
+            silog = self.silog_loss(pred_norm_log, target_norm_log, mask)
+            grad = self.grad_loss(pred_norm_log, target_norm_log, mask)
             scale_loss = self.silog_weight * silog + self.grad_weight * grad
 
             scale_weight = 1.0 / scale
             if scale == 2:
-                scale_weight *= 8.0  # 给最高分辨率的输出更高权重
+                scale_weight *= 1.0  # 给最高分辨率的输出更高权重
             total_loss += scale_weight * scale_loss
 
             # 仅用于日志的子项，提前 detach，避免构建过大的计算图

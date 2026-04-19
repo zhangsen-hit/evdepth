@@ -115,12 +115,16 @@ class Module(pl.LightningModule):
             self.val_batch_size = None
             self.started_training = False
 
+            # epoch 级别 loss 累加器（用于 local_loss 文件写入）
+            self._epoch_loss_sum = 0.0
+            self._epoch_loss_count = 0
+
             # 新一轮训练开始时，清空本地的指标日志文件（仅在主进程执行）
             try:
                 import os
                 if getattr(getattr(self, "trainer", None), "is_global_zero", True):
                     os.makedirs("local_loss", exist_ok=True)
-                    for name in ("train_loss.txt", "train_delta1.txt", "val_rmse.txt", "val_delta1.txt"):
+                    for name in ("train_loss.txt", "train_lr.txt", "train_delta1.txt", "val_rmse.txt", "val_delta1.txt"):
                         path = os.path.join("local_loss", name)
                         if os.path.exists(path):
                             os.remove(path)
@@ -272,17 +276,12 @@ class Module(pl.LightningModule):
         log_dict = {f'{prefix}{k}': v for k, v in losses_dict.items()}
         self.log_dict(log_dict, on_step=True, on_epoch=True, batch_size=batch_size, sync_dist=True)
 
-        # 将每一步的总 loss 写入本地文件，便于后处理/画曲线（仅 rank 0 写入，避免 DDP 多进程竞争）
-        if self.global_rank == 0:
-            try:
-                loss_scalar = float(total_loss.detach().cpu().item())
-                import os
-                os.makedirs("local_loss", exist_ok=True)
-                file_mode = "w" if step == 0 else "a"
-                with open(os.path.join("local_loss", "train_loss.txt"), file_mode) as f:
-                    f.write(f"{step}\t{loss_scalar}\n")
-            except Exception:
-                pass
+        # 累加当前 step 的 loss，在 on_train_epoch_end 中写入 epoch 平均值
+        try:
+            self._epoch_loss_sum += float(total_loss.detach().cpu().item())
+            self._epoch_loss_count += 1
+        except Exception:
+            pass
         
         # Add to depth evaluator (at pred resolution)
         if self.train_depth_evaluator is not None:
@@ -558,27 +557,25 @@ class Module(pl.LightningModule):
                 # 使用当前 global_step 作为统一的 step，避免与其他日志出现 step 乱序
                 self.logger.log_metrics(metrics=log_dict, step=step)
 
-                # 额外将关键标量写入本地，便于训练结束后统一画图
+                # 额外将关键标量写入本地（以 epoch 为横轴），便于训练结束后统一画图
                 try:
                     import os
+                    epoch = self.current_epoch
                     os.makedirs("local_loss", exist_ok=True)
-                    # 训练阶段：只记录 delta1_train
                     if mode == "train" and "delta1" in metrics:
-                        file_mode = "w" if step == 0 else "a"
+                        file_mode = "w" if epoch == 0 else "a"
                         with open(os.path.join("local_loss", "train_delta1.txt"), file_mode) as f:
-                            f.write(f"{step}\t{metrics['delta1']}\n")
-                    # 验证阶段：记录 rmse 作为验证 loss，以及 delta1_val
+                            f.write(f"{epoch}\t{metrics['delta1']}\n")
                     if mode == "val":
                         if "rmse" in metrics:
-                            file_mode = "w" if step == 0 else "a"
+                            file_mode = "w" if epoch == 0 else "a"
                             with open(os.path.join("local_loss", "val_rmse.txt"), file_mode) as f:
-                                f.write(f"{step}\t{metrics['rmse']}\n")
+                                f.write(f"{epoch}\t{metrics['rmse']}\n")
                         if "delta1" in metrics:
-                            file_mode = "w" if step == 0 else "a"
+                            file_mode = "w" if epoch == 0 else "a"
                             with open(os.path.join("local_loss", "val_delta1.txt"), file_mode) as f:
-                                f.write(f"{step}\t{metrics['delta1']}\n")
+                                f.write(f"{epoch}\t{metrics['delta1']}\n")
                 except Exception:
-                    # 本地日志失败不影响训练
                     pass
 
             depth_evaluator.reset_buffer()
@@ -592,6 +589,34 @@ class Module(pl.LightningModule):
                 depth_metrics_every_n_steps is None and \
                 self.train_hw is not None:
             self.run_depth_evaluator(mode=mode)
+
+        # 将本 epoch 的平均 train loss 写入本地文件（仅 rank 0）
+        if self.global_rank == 0 and self._epoch_loss_count > 0:
+            try:
+                import os
+                epoch = self.current_epoch
+                avg_loss = self._epoch_loss_sum / self._epoch_loss_count
+                os.makedirs("local_loss", exist_ok=True)
+                file_mode = "w" if epoch == 0 else "a"
+                with open(os.path.join("local_loss", "train_loss.txt"), file_mode) as f:
+                    f.write(f"{epoch}\t{avg_loss}\n")
+            except Exception:
+                pass
+        self._epoch_loss_sum = 0.0
+        self._epoch_loss_count = 0
+
+        # 将本 epoch 结束时的学习率写入本地文件（仅 rank 0）
+        if self.global_rank == 0:
+            try:
+                import os
+                epoch = self.current_epoch
+                lr = self.trainer.optimizers[0].param_groups[0]['lr']
+                os.makedirs("local_loss", exist_ok=True)
+                file_mode = "w" if epoch == 0 else "a"
+                with open(os.path.join("local_loss", "train_lr.txt"), file_mode) as f:
+                    f.write(f"{epoch}\t{lr}\n")
+            except Exception:
+                pass
     
     def on_validation_epoch_end(self) -> None:
         mode = "val"
@@ -624,7 +649,7 @@ class Module(pl.LightningModule):
             total_steps=total_steps,
             pct_start=scheduler_params['pct_start'],
             cycle_momentum=False,
-            anneal_strategy='linear')
+            anneal_strategy='cos')
         lr_scheduler_config = {
             "scheduler": lr_scheduler,
             "interval": "step",
@@ -635,39 +660,4 @@ class Module(pl.LightningModule):
         
         return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler_config}
     
-    def optimizer_step(self, epoch: int, batch_idx: int, optimizer, optimizer_closure, on_tpu: bool = False, 
-                       using_native_amp: bool = False, using_lbfgs: bool = False) -> None:
-        """
-        重写optimizer_step以确保在optimizer.step()之后调用scheduler.step()
-        这对于OneCycleLR等调度器是必需的（PyTorch 1.1.0+）
-        
-        注意：必须正确执行closure（包含前向和反向传播），然后执行optimizer.step()，最后更新scheduler
-        """
-        # 对于LBFGS优化器，closure会作为参数传递给optimizer.step()
-        if using_lbfgs:
-            # LBFGS需要closure作为参数，它会内部处理梯度裁剪
-            optimizer.step(closure=optimizer_closure)
-        else:
-            # 对于其他优化器：
-            # 1. 先执行closure（包含前向传播、反向传播等）
-            #    closure内部会处理梯度裁剪（如果Trainer配置了gradient_clip_val）
-            optimizer_closure()
-            
-            # 2. 执行optimizer.step()更新参数
-            optimizer.step()
-        
-        # 3. 在optimizer.step()之后更新学习率调度器
-        # 这对于OneCycleLR是必需的（PyTorch 1.1.0+要求：必须先optimizer.step()，后scheduler.step()）
-        lr_scheduler_config = self.train_config.get('lr_scheduler', {})
-        if lr_scheduler_config.get('use', False):
-            lr_schedulers = self.lr_schedulers()
-            if lr_schedulers is not None:
-                # lr_schedulers()可能返回单个调度器或列表
-                if isinstance(lr_schedulers, (list, tuple)):
-                    for scheduler in lr_schedulers:
-                        if scheduler is not None:
-                            scheduler.step()
-                else:
-                    if lr_schedulers is not None:
-                        lr_schedulers.step()
 
