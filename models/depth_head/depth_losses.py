@@ -108,51 +108,101 @@ class SILogLoss(nn.Module):
         return loss
 
 
-class GradientLoss(nn.Module):
+class MultiScaleGradientLoss(nn.Module):
     """
-    Image gradient loss to encourage smooth depth predictions
-    Computes L1 loss on spatial gradients
+    E2Depth 风格的多尺度梯度匹配损失 (Hidalgo-Carrio et al., 3DV 2020)。
+
+    注意：这里的 "多尺度" 指的是**同一张最终 residual 的不同下采样尺度**，
+    而不是 decoder 的多个输出头。公式：
+
+        R = pred_final - target
+        R^s = downsample^s(R)      # s = 0, 1, 2, 3
+        L_grad = (1 / n_valid) * sum_s sum_u ( |∂x R^s(u)| + |∂y R^s(u)| )
+
+    作用是鼓励深度平滑、同时保留清晰的深度不连续边界。
+
+    稀疏 GT / mask 处理：
+    - residual 与 mask 同步 avg_pool2d 下采样；
+    - 下采样过程中使用 "只对有效像素求均值" 的方式，避免无效像素把残差人为拉向 0；
+    - 梯度项只在 **相邻两格都有效** 的位置计入损失；
+    - 某尺度有效对数过少时，不会触发除零。
     """
-    def __init__(self):
+
+    def __init__(self, num_scales: int = 4, mask_threshold: float = 0.0):
         super().__init__()
-    
-    def gradient(self, x: torch.Tensor):
-        """Compute spatial gradients"""
-        # Gradient in x direction
+        self.num_scales = int(num_scales)
+        # 下采样后一个 2x2 块的有效占比严格大于该阈值，才视为该粗尺度块有效
+        # 0.0 表示 "只要块内有一个有效像素就保留"，对稀疏 LiDAR 比较友好
+        self.mask_threshold = float(mask_threshold)
+
+    @staticmethod
+    def _gradient_xy(x: torch.Tensor):
         grad_x = x[:, :, :, :-1] - x[:, :, :, 1:]
-        # Gradient in y direction
         grad_y = x[:, :, :-1, :] - x[:, :, 1:, :]
         return grad_x, grad_y
-    
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None):
         """
         Args:
-            pred: predicted depth (B, 1, H, W) in normalized log space
-            target: ground truth depth (B, 1, H, W) in normalized log space
-            mask: valid depth mask (B, 1, H, W)
+            pred:   最终（最高分辨率）深度预测，(B, 1, H, W)，与 target 在同一空间
+                    （当前项目是 norm_log 空间）。
+            target: GT 深度，(B, 1, H, W)，同上空间。
+            mask:   有效像素 mask，(B, 1, H, W) bool/0-1，可为 None。
         """
-        pred_grad_x, pred_grad_y = self.gradient(pred)
-        target_grad_x, target_grad_y = self.gradient(target)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"pred and target must have same shape, got {pred.shape} vs {target.shape}"
+            )
+
+        residual = pred - target
 
         if mask is not None:
-            # Adjust mask for gradient dimensions
-            mask_x = mask[:, :, :, :-1] * mask[:, :, :, 1:]
-            mask_y = mask[:, :, :-1, :] * mask[:, :, 1:, :]
-
-            diff_x = torch.abs(pred_grad_x - target_grad_x)
-            diff_y = torch.abs(pred_grad_y - target_grad_y)
-
-            # If there are no valid pixels for gradients, return zero loss
-            if mask_x.sum() == 0 and mask_y.sum() == 0:
-                return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-
-            loss_x = diff_x[mask_x].mean() if mask_x.any() else torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-            loss_y = diff_y[mask_y].mean() if mask_y.any() else torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+            mask_f = mask.to(residual.dtype)
+            # 把无效像素处的 residual 置 0；后续用 mask 归一化，等价于 "对有效像素求均值"
+            cur_res = residual * mask_f
+            cur_mask = mask_f
         else:
-            loss_x = torch.abs(pred_grad_x - target_grad_x).mean()
-            loss_y = torch.abs(pred_grad_y - target_grad_y).mean()
+            cur_res = residual
+            cur_mask = None
 
-        return loss_x + loss_y
+        total_loss = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        total_count = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        for s in range(self.num_scales):
+            if s > 0:
+                # —— 同步下采样 residual 和 mask ——
+                if cur_mask is not None:
+                    weighted = F.avg_pool2d(cur_res, kernel_size=2, stride=2)
+                    mask_avg = F.avg_pool2d(cur_mask, kernel_size=2, stride=2)
+                    # 仅对块内有效像素求均值：sum(res*mask)/sum(mask)
+                    cur_res = weighted / mask_avg.clamp(min=1e-6)
+                    cur_mask = (mask_avg > self.mask_threshold).to(cur_res.dtype)
+                    cur_res = cur_res * cur_mask  # 无效块再置 0，防止数值泄漏
+                else:
+                    cur_res = F.avg_pool2d(cur_res, kernel_size=2, stride=2)
+
+            # 防御：太小的 feature map 无法做差分
+            if cur_res.shape[-1] < 2 or cur_res.shape[-2] < 2:
+                break
+
+            grad_x, grad_y = self._gradient_xy(cur_res)
+
+            if cur_mask is not None:
+                # 只有相邻两格都有效，对应位置的梯度才计入
+                mx = cur_mask[:, :, :, :-1] * cur_mask[:, :, :, 1:]
+                my = cur_mask[:, :, :-1, :] * cur_mask[:, :, 1:, :]
+                total_loss = total_loss + (grad_x.abs() * mx).sum() + (grad_y.abs() * my).sum()
+                total_count = total_count + mx.sum() + my.sum()
+            else:
+                total_loss = total_loss + grad_x.abs().sum() + grad_y.abs().sum()
+                total_count = total_count + torch.tensor(
+                    float(grad_x.numel() + grad_y.numel()),
+                    device=pred.device, dtype=pred.dtype,
+                )
+
+        # 整体按有效像素数归一化；有效像素过少时 clamp 到 1 可避免除零
+        # （此时 total_loss 本身也近似为 0，不会制造虚假梯度）
+        return total_loss / total_count.clamp(min=1.0)
 
 
 class DepthLoss(nn.Module):
@@ -193,7 +243,9 @@ class DepthLoss(nn.Module):
             far_weight_alpha=far_weight_alpha,
             far_weight_t0=far_weight_t0,
         )
-        self.grad_loss = GradientLoss()
+        # E2Depth 风格：gradient loss 只作用在最终（最高分辨率）预测的 residual 上，
+        # 并在 residual 的多个下采样尺度上累计（默认 4 个尺度）。
+        self.grad_loss = MultiScaleGradientLoss(num_scales=4)
 
     def log_depth_to_norm_log_depth(self, log_depth: torch.Tensor) -> torch.Tensor:
         """
@@ -273,9 +325,14 @@ class DepthLoss(nn.Module):
         关键原则（参考 Monodepth2）：不下采样稀疏 GT，而是把各尺度预测统一上采样到 GT
         的原始分辨率，只在原始高分辨率 mask 的有效点上计算 loss。这样做的好处：
         1) 不丢失本就稀疏的激光雷达有效点；
-        2) 不把“无效值”随下采样扩散到更大范围（否则近地面的无效区会越来越大，
+        2) 不把"无效值"随下采样扩散到更大范围（否则近地面的无效区会越来越大，
            与天空成片无效混淆，导致近地面被错估为远处并出现条纹状伪影）；
         3) 低分辨率层也能受到原分辨率 GT 的高频精确监督。
+
+        E2Depth 修正（重要）：
+        - SILog 主损失仍在多个 decoder 输出尺度上监督（auxiliary supervision，不变）。
+        - gradient loss 不再对每个 decoder 头分别计算，而是只对最终（最高分辨率）预测
+          `depth_2` 计算一次 E2Depth 风格多尺度 residual gradient loss。
         """
         total_loss = torch.zeros((), device=target.device, dtype=target.dtype)
         losses_dict = {}
@@ -286,6 +343,7 @@ class DepthLoss(nn.Module):
         if mask is not None and mask.dtype != torch.bool:
             mask = mask.bool()
 
+        # ---- (1) SILog 主损失：保留原有多尺度 decoder 头监督 ----
         for scale in self.scales:
             key = f'depth_{scale}'
             if key not in predictions:
@@ -305,17 +363,30 @@ class DepthLoss(nn.Module):
             pred_norm_log = torch.clamp(pred_up, 0.0, 1.0)
 
             silog = self.silog_loss(pred_norm_log, target_norm_log, mask)
-            grad = self.grad_loss(pred_norm_log, target_norm_log, mask)
-            scale_loss = self.silog_weight * silog + self.grad_weight * grad
+            scale_loss = self.silog_weight * silog
 
-            scale_weight = 1.0 / scale
-            if scale == 2:
-                scale_weight *= 1.0  # 给最高分辨率的输出更高权重
-            total_loss += scale_weight * scale_loss
+            scale_weight = 1.0 / scale  # 高分辨率头权重更大
+            total_loss = total_loss + scale_weight * scale_loss
 
-            # 仅用于日志的子项，提前 detach，避免构建过大的计算图
             losses_dict[f'silog_{scale}'] = silog.detach()
-            losses_dict[f'grad_{scale}'] = grad.detach()
+
+        # ---- (2) E2Depth 多尺度 gradient loss：仅作用于最终最高分辨率预测 ----
+        # 约定最精细 decoder 输出头（scales 里最小的那个，一般是 depth_2）作为 pred_final。
+        finest_scale = min(self.scales) if len(self.scales) > 0 else None
+        finest_key = f'depth_{finest_scale}' if finest_scale is not None else None
+        if finest_key is not None and finest_key in predictions:
+            pred_final = predictions[finest_key]
+            if pred_final.shape[-2:] != target_hw:
+                pred_final = F.interpolate(
+                    pred_final, size=target_hw, mode='bilinear', align_corners=False
+                )
+            pred_final_norm_log = torch.clamp(pred_final, 0.0, 1.0)
+
+            grad_multiscale = self.grad_loss(
+                pred_final_norm_log, target_norm_log, mask
+            )
+            total_loss = total_loss + self.grad_weight * grad_multiscale
+            losses_dict['grad_multiscale'] = grad_multiscale.detach()
 
         # 总损失必须保持梯度信息，不能 detach
         losses_dict['loss'] = total_loss
