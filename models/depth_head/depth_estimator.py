@@ -50,6 +50,9 @@ class DepthEstimator(th.nn.Module):
         self.depth_head = build_depth_head(head_cfg, in_channels=in_channels)
 
         # Build loss function
+        far_weight_cfg = loss_cfg.get("far_weight", {}) or {}
+        if not isinstance(far_weight_cfg, dict):
+            far_weight_cfg = {}
         self.loss_fn = DepthLoss(
             silog_weight=loss_cfg.get("silog_weight", 1.0),
             grad_weight=loss_cfg.get("grad_weight", 0.5),
@@ -57,6 +60,8 @@ class DepthEstimator(th.nn.Module):
             scales=loss_cfg.get("scales", [2, 4, 8, 16]),
             depth_min=min_depth,
             depth_max=max_depth,
+            far_weight_alpha=far_weight_cfg.get("alpha", 0.0),
+            far_weight_t0=far_weight_cfg.get("t0", 0.3),
         )
 
     def forward_backbone(
@@ -97,7 +102,7 @@ class DepthEstimator(th.nn.Module):
             predictions = self.depth_head(fpn_features)
 
         losses = None
-        if self.training and targets is not None:
+        if targets is not None:
             with CudaTimer(device=device, timer_name="Depth Loss"):
                 total_loss, losses_dict = self.loss_fn(predictions, targets, masks)
                 losses = losses_dict

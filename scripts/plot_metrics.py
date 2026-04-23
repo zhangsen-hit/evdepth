@@ -42,6 +42,10 @@ def load_train_delta1():
 
 
 def load_val_loss():
+    return _load_xy(os.path.join(LOCAL_DIR, "val_loss.txt"))
+
+
+def load_val_rmse():
     return _load_xy(os.path.join(LOCAL_DIR, "val_rmse.txt"))
 
 
@@ -77,9 +81,12 @@ def plot_all():
     # 2) 训练 delta1
     s, v = load_train_delta1()
     _plot_curve(s, v, "delta1", "Train δ1 vs. epoch", "train_delta1_curve.png")
-    # 3) 验证 loss（这里用 rmse 作为验证 loss）
+    # 3) 验证 loss（模型输出的直接 loss）
     s, v = load_val_loss()
-    _plot_curve(s, v, "rmse", "Val loss (RMSE) vs. epoch", "val_loss_curve.png")
+    _plot_curve(s, v, "loss", "Val loss vs. epoch", "val_loss_curve.png")
+    # 3b) 验证 RMSE（深度评估指标）
+    s, v = load_val_rmse()
+    _plot_curve(s, v, "rmse", "Val RMSE vs. epoch", "val_rmse_curve.png")
     # 4) 验证 delta1
     s, v = load_val_delta1()
     _plot_curve(s, v, "delta1", "Val δ1 vs. epoch", "val_delta1_curve.png")

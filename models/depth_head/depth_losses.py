@@ -54,11 +54,30 @@ class SILogLoss(nn.Module):
     """
     Scale-Invariant Logarithmic loss
     Invariant to global scale of the scene
+
+    可选：远距像素软加权
+        w_i = 1 + alpha * clamp((t_i - t0) / (1 - t0), 0, 1)
+    其中 t_i 为 target 在 norm_log 空间的值（∈[0,1]）。
+    alpha=0 时严格等价于未加权版本。权重只依赖 target，且会 detach，不参与反传。
     """
-    def __init__(self, lambd: float = 0.5):
+    def __init__(self, lambd: float = 0.5, far_weight_alpha: float = 0.0, far_weight_t0: float = 0.3):
         super().__init__()
         self.lambd = lambd
-    
+        self.far_weight_alpha = float(far_weight_alpha)
+        self.far_weight_t0 = float(far_weight_t0)
+        if not (0.0 <= self.far_weight_t0 < 1.0):
+            raise ValueError(f"far_weight_t0 must be in [0, 1), got {far_weight_t0}")
+
+    def _far_weight(self, target_norm_log: torch.Tensor) -> torch.Tensor:
+        """基于 target 的 per-pixel 远距权重；alpha=0 时为全 1。"""
+        if self.far_weight_alpha == 0.0:
+            return torch.ones_like(target_norm_log)
+        denom = max(1.0 - self.far_weight_t0, 1e-6)
+        w = 1.0 + self.far_weight_alpha * torch.clamp(
+            (target_norm_log - self.far_weight_t0) / denom, 0.0, 1.0
+        )
+        return w.detach()
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None):
         """
         Args:
@@ -75,10 +94,17 @@ class SILogLoss(nn.Module):
             return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
 
         diff = pred - target
-        
-        # Scale-invariant term
-        loss = torch.mean(diff ** 2) - self.lambd * (torch.mean(diff) ** 2)
-        
+
+        if self.far_weight_alpha == 0.0:
+            loss = torch.mean(diff ** 2) - self.lambd * (torch.mean(diff) ** 2)
+            return loss
+
+        # 加权版 SILog：用 target 作为远近度量计算权重，保持尺度不变项形式
+        w = self._far_weight(target)
+        w_sum = w.sum().clamp(min=1e-6)
+        mean_wdiff2 = (w * diff ** 2).sum() / w_sum
+        mean_wdiff = (w * diff).sum() / w_sum
+        loss = mean_wdiff2 - self.lambd * (mean_wdiff ** 2)
         return loss
 
 
@@ -142,6 +168,8 @@ class DepthLoss(nn.Module):
         scales: list = [2, 4, 8, 16],  # Multi-scale outputs
         depth_min: float = 0.5,
         depth_max: float = 80.0,
+        far_weight_alpha: float = 0.0,
+        far_weight_t0: float = 0.3,
     ):
         super().__init__()
         self.silog_weight = silog_weight
@@ -160,7 +188,11 @@ class DepthLoss(nn.Module):
         self._log_depth_max = math.log(self.depth_max)
         self._log_depth_denom = self._log_depth_max - self._log_depth_min  # > 0
 
-        self.silog_loss = SILogLoss(lambd=silog_lambda)
+        self.silog_loss = SILogLoss(
+            lambd=silog_lambda,
+            far_weight_alpha=far_weight_alpha,
+            far_weight_t0=far_weight_t0,
+        )
         self.grad_loss = GradientLoss()
 
     def log_depth_to_norm_log_depth(self, log_depth: torch.Tensor) -> torch.Tensor:

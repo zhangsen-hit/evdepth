@@ -99,7 +99,7 @@ def main():
                         help='Batch size（不传则使用配置文件中的值）')
     parser.add_argument('--lr', type=float, default=0.002,
                         help='学习率')
-    parser.add_argument('--max_epochs', type=int, default=50,
+    parser.add_argument('--max_epochs', type=int, default=1000,
                         help='最大训练轮数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子（不填则使用配置文件中的 reproduce.seed_everything）')

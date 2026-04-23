@@ -118,13 +118,17 @@ class Module(pl.LightningModule):
             # epoch 级别 loss 累加器（用于 local_loss 文件写入）
             self._epoch_loss_sum = 0.0
             self._epoch_loss_count = 0
+            # 验证 loss 累加器
+            self._val_epoch_loss_sum = 0.0
+            self._val_epoch_loss_count = 0
 
             # 新一轮训练开始时，清空本地的指标日志文件（仅在主进程执行）
             try:
                 import os
                 if getattr(getattr(self, "trainer", None), "is_global_zero", True):
                     os.makedirs("local_loss", exist_ok=True)
-                    for name in ("train_loss.txt", "train_lr.txt", "train_delta1.txt", "val_rmse.txt", "val_delta1.txt"):
+                    for name in ("train_loss.txt", "train_lr.txt", "train_delta1.txt",
+                                 "val_loss.txt", "val_rmse.txt", "val_delta1.txt"):
                         path = os.path.join("local_loss", name)
                         if os.path.exists(path):
                             os.remove(path)
@@ -384,6 +388,8 @@ class Module(pl.LightningModule):
         viz_depth_gts = []
         viz_ev_reprs = []
         viz_depth_masks = []  # 与 viz_depth_gts 同分辨率，True=有效，用于 GT 无效值显示为无限远
+        val_loss_sum = 0.0
+        val_loss_count = 0
         # Process sequence
         for tidx in range(sequence_len):
             ev_tensors = ev_tensor_sequence[tidx]
@@ -401,14 +407,34 @@ class Module(pl.LightningModule):
                 else:
                     assert self.test_hw == ev_tensors.shape[-2:]
             
-            # Forward pass (no loss computation during validation)
-            predictions, _, prev_states = self.mdl(
-                x=ev_tensors,
-                previous_states=prev_states,
-                retrieve_depth=True,
-                targets=None,
-                masks=None
-            )
+            # 验证阶段：同时计算 loss，用于写入 val_loss.txt
+            if mode == "val":
+                depth_gt_tgt = depth_gt_sequence[tidx].to(dtype=self.dtype)
+                depth_gt_tgt = self.input_padder.pad_tensor_ev_repr(depth_gt_tgt)
+                depth_gt_tgt = self.log_depth_to_norm_log_depth(depth_gt_tgt)
+                if depth_mask_sequence is not None:
+                    depth_mask_tgt = depth_mask_sequence[tidx]
+                    depth_mask_tgt = self.input_padder.pad_tensor_ev_repr(depth_mask_tgt)
+                else:
+                    depth_mask_tgt = None
+                predictions, val_losses, prev_states = self.mdl(
+                    x=ev_tensors,
+                    previous_states=prev_states,
+                    retrieve_depth=True,
+                    targets=depth_gt_tgt,
+                    masks=depth_mask_tgt,
+                )
+                if val_losses is not None:
+                    val_loss_sum += float(val_losses['loss'].detach())
+                    val_loss_count += 1
+            else:
+                predictions, _, prev_states = self.mdl(
+                    x=ev_tensors,
+                    previous_states=prev_states,
+                    retrieve_depth=True,
+                    targets=None,
+                    masks=None,
+                )
 
             # 收集当前时间步用于可视化（仅取 batch 内第 0 个样本）
             pred_t = predictions['depth_2']  # (B, 1, H', W')
@@ -441,6 +467,10 @@ class Module(pl.LightningModule):
 
         if mode == "val":
             self.val_rnn_states.save_states_and_detach(worker_id=worker_id, states=prev_states)
+            # 将本 batch 序列的平均 val loss 累积到 epoch 累加器
+            if val_loss_count > 0:
+                self._val_epoch_loss_sum += val_loss_sum / val_loss_count
+                self._val_epoch_loss_count += 1
         else:
             self.test_rnn_states.save_states_and_detach(worker_id=worker_id, states=prev_states)
         
@@ -622,6 +652,21 @@ class Module(pl.LightningModule):
         mode = "val"
         if self.started_training and self.val_depth_evaluator is not None and self.val_depth_evaluator.has_data():
             self.run_depth_evaluator(mode=mode)
+
+        # 将本 epoch 的平均验证 loss 写入本地文件（仅 rank 0）
+        if self.global_rank == 0 and self._val_epoch_loss_count > 0:
+            try:
+                import os
+                epoch = self.current_epoch
+                avg_val_loss = self._val_epoch_loss_sum / self._val_epoch_loss_count
+                os.makedirs("local_loss", exist_ok=True)
+                file_mode = "w" if epoch == 0 else "a"
+                with open(os.path.join("local_loss", "val_loss.txt"), file_mode) as f:
+                    f.write(f"{epoch}\t{avg_val_loss}\n")
+            except Exception:
+                pass
+        self._val_epoch_loss_sum = 0.0
+        self._val_epoch_loss_count = 0
     
     def on_test_epoch_end(self) -> None:
         mode = "test"
