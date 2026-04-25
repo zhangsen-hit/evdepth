@@ -14,7 +14,7 @@ except ImportError:
     th_compile = None
 
 from data.utils.types import FeatureMap, BackboneFeatures, LstmState, LstmStates
-from models.backbone.rnn import DWSConvLSTM2d, DWSConvSTLSTM2d
+from models.backbone.rnn import DWSConvLSTM2d, DWSConvSTLSTM2d, _gn_num_groups
 from models.backbone.base import BaseDetector
 
 
@@ -108,8 +108,11 @@ class MobileNetRNNStage(nn.Module):
             dws_conv_only_hidden=lstm_cfg.get('dws_conv_only_hidden', True),
             dws_conv_kernel_size=lstm_cfg.get('dws_conv_kernel_size', 3),
             cell_update_dropout=lstm_cfg.get('drop_cell_update', 0),
+            T_max_chrono_init=T_max_chrono_init,
         )
         if cell_type == 'stlstm':
+            cell_kwargs['dws_on_spatial_m'] = lstm_cfg.get('dws_on_spatial_m', True)
+            cell_kwargs['use_group_norm'] = lstm_cfg.get('use_group_norm', True)
             self.lstm = DWSConvSTLSTM2d(**cell_kwargs)
         elif cell_type == 'convlstm':
             self.lstm = DWSConvLSTM2d(**cell_kwargs)
@@ -206,6 +209,9 @@ class MobileNetRNN(BaseDetector):
         print(f"  Stage dimensions: {[embed_dim * x for x in dim_multiplier_per_stage]}")
         print(f"  Blocks per stage: {num_blocks_per_stage}")
         print(f"  Recurrent cell type: {cell_type}")
+        if cell_type == 'stlstm':
+            z = stage_cfg.get('lstm', {}).get('zigzag', False)
+            print(f"  ST-LSTM zigzag M routing: {z}")
         print(f"  Token masking: {enable_masking}")
         print("="*60 + "\n")
 
@@ -263,20 +269,37 @@ class MobileNetRNN(BaseDetector):
             self.stages.append(stage)
             input_dim = stage_dim
 
-        # Zigzag M adapters: channel projection + spatial resize between stages
+        # Zigzag M adapters: AvgPool + 1x1 + GN + SiLU (more stable than strided 2x2)
         if self.use_zigzag:
-            # Forward adapters: stage l -> stage l+1 (downsample 2x, project channels)
+            d0 = self.stage_dims[0]
+            d_last = self.stage_dims[-1]
+            g0 = _gn_num_groups(d0)
+            # Forward: stage l -> l+1 (2x downsample)
             self.m_adapters_forward = nn.ModuleList()
             for i in range(num_stages - 1):
+                di, d_next = self.stage_dims[i], self.stage_dims[i + 1]
+                g = _gn_num_groups(d_next)
                 self.m_adapters_forward.append(
-                    nn.Conv2d(self.stage_dims[i], self.stage_dims[i + 1],
-                              kernel_size=2, stride=2, bias=False)
+                    nn.Sequential(
+                        nn.AvgPool2d(kernel_size=2, stride=2),
+                        nn.Conv2d(di, d_next, kernel_size=1, bias=False),
+                        nn.GroupNorm(g, d_next),
+                        nn.SiLU(inplace=True),
+                    )
                 )
-            # Zigzag adapter: last stage -> first stage (project channels, upsample in forward)
-            self.m_adapter_zigzag = nn.Conv2d(
-                self.stage_dims[-1], self.stage_dims[0], kernel_size=1, bias=False
+            # Zigzag: last -> first resolution (1x1 project, then upsample in forward, then refine)
+            self.m_adapter_zigzag = nn.Sequential(
+                nn.Conv2d(d_last, d0, kernel_size=1, bias=False),
+                nn.GroupNorm(g0, d0),
+                nn.SiLU(inplace=True),
             )
-            print(f"  Zigzag M adapters: enabled")
+            self.m_adapter_zigzag_refine = nn.Sequential(
+                nn.Conv2d(d0, d0, kernel_size=5, padding=2, groups=d0, bias=False),
+                nn.GroupNorm(g0, d0),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(d0, d0, kernel_size=1, bias=False),
+            )
+            print("  Zigzag M adapters: enabled (pool+1x1+GN+SiLU, zigzag 5x5 DW refine)")
 
     def get_stage_dims(self, stages: Tuple[int, ...]) -> Tuple[int, ...]:
         """Get dimensions of specified stages"""
@@ -342,6 +365,7 @@ class MobileNetRNN(BaseDetector):
             m_current = F.interpolate(
                 m_current, size=expected_hw_list[0],
                 mode='bilinear', align_corners=False)
+            m_current = self.m_adapter_zigzag_refine(m_current)
         
         for stage_idx, (stage, prev_state) in enumerate(zip(self.stages, prev_states)):
             expected_hw = expected_hw_list[stage_idx]

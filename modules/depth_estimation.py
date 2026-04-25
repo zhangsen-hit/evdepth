@@ -101,8 +101,9 @@ class Module(pl.LightningModule):
             self.train_config = self.full_config['training']
             self.train_metrics_config = self.full_config['logging']['train']['metrics']
             
-            if self.train_metrics_config.get('compute', False):
-                self.train_depth_evaluator = DepthEvaluator(min_depth=min_depth, max_depth=max_depth)
+            # 与 val 相同：每 epoch 在本地算深度指标；compute 只控制是否同步到 Lightning/W&B
+            self._log_train_depth_metrics = self.train_metrics_config.get('compute', False)
+            self.train_depth_evaluator = DepthEvaluator(min_depth=min_depth, max_depth=max_depth)
             self.val_depth_evaluator = DepthEvaluator(min_depth=min_depth, max_depth=max_depth)
 
             self.train_sampling_mode = dataset_train_sampling
@@ -294,7 +295,7 @@ class Module(pl.LightningModule):
             depth_metrics_every_n_steps = self.train_metrics_config.get('depth_metrics_every_n_steps')
             if depth_metrics_every_n_steps is not None and \
                     step > 0 and step % depth_metrics_every_n_steps == 0:
-                self.run_depth_evaluator(mode=mode)
+                self.run_depth_evaluator(mode=mode, write_local_train_delta1=False)
         
         # Viz: same resolution as event (input_hw) so no padding/size mismatch in logs
         depth_pred_for_viz = F.interpolate(depth_pred_viz, size=input_hw, mode='bilinear', align_corners=False)
@@ -538,7 +539,7 @@ class Module(pl.LightningModule):
     def test_step(self, batch: Any, batch_idx: int) -> Optional[STEP_OUTPUT]:
         return self._val_test_step_impl(batch=batch, mode="test")
     
-    def run_depth_evaluator(self, mode: str):
+    def run_depth_evaluator(self, mode: str, write_local_train_delta1: bool = True):
         if mode == "train":
             depth_evaluator = self.train_depth_evaluator
             batch_size = self.train_batch_size
@@ -575,24 +576,25 @@ class Module(pl.LightningModule):
                 assert value.ndim == 0, f'tensor must be a scalar.\n{v=}\n{type(v)=}\n{value=}\n{type(value)=}'
                 log_dict[f'{prefix}{k}'] = value.to(self.device)
 
-            # 记录到 Lightning / WandB
-            self.log_dict(log_dict, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-                for k, v in log_dict.items():
-                    dist.reduce(log_dict[k], dst=0, op=dist.ReduceOp.SUM)
-                    if dist.get_rank() == 0:
-                        log_dict[k] /= dist.get_world_size()
-            if self.trainer.is_global_zero:
-                # 使用当前 global_step 作为统一的 step，避免与其他日志出现 step 乱序
-                self.logger.log_metrics(metrics=log_dict, step=step)
+            # 训练集深度指标仅当 logging.train.metrics.compute 为真时同步到 Lightning / WandB
+            if mode != "train" or self._log_train_depth_metrics:
+                self.log_dict(log_dict, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                    for k, v in log_dict.items():
+                        dist.reduce(log_dict[k], dst=0, op=dist.ReduceOp.SUM)
+                        if dist.get_rank() == 0:
+                            log_dict[k] /= dist.get_world_size()
+                if self.trainer.is_global_zero:
+                    self.logger.log_metrics(metrics=log_dict, step=step)
 
-                # 额外将关键标量写入本地（以 epoch 为横轴），便于训练结束后统一画图
+            if self.trainer.is_global_zero:
+                # 与 train_loss / val_delta1 相同：以 epoch 为行追加写入 local_loss（步间子评估不写 train_delta1）
                 try:
                     import os
                     epoch = self.current_epoch
                     os.makedirs("local_loss", exist_ok=True)
-                    if mode == "train" and "delta1" in metrics:
+                    if mode == "train" and write_local_train_delta1 and "delta1" in metrics:
                         file_mode = "w" if epoch == 0 else "a"
                         with open(os.path.join("local_loss", "train_delta1.txt"), file_mode) as f:
                             f.write(f"{epoch}\t{metrics['delta1']}\n")

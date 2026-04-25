@@ -12,6 +12,7 @@
 import argparse
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,17 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 # 添加项目路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+
+# OneCycleLR 在 __init__ 中会通过 _internal step 先调用一次 scheduler.step()，随后 Lightning
+# 在首步又调用一次；再叠加 16-mixed/GradScaler 时 opt.step 的包装，易触发误报的 UserWarning。
+# 官方训练顺序在 Lightning 中仍是 optimizer 先于 scheduler，可安全忽略；见
+# https://github.com/Lightning-AI/lightning/issues/17958 及 PyTorch lr_scheduler 中 _opt_called 检测。
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module="torch.optim.lr_scheduler",
+    message=r"Detected call of `lr_scheduler\.step\(\)` before `optimizer\.step\(\)`\.",
+)
 
 from callbacks.custom import get_ckpt_callback, get_viz_callback
 from callbacks.gradflow import GradFlowLogCallback

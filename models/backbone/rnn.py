@@ -1,7 +1,26 @@
+import math
 from typing import Optional, Tuple
 
 import torch as th
 import torch.nn as nn
+
+
+def _gn_num_groups(channels: int, preferred: int = 8) -> int:
+    g = min(preferred, channels)
+    while g > 1 and channels % g != 0:
+        g -= 1
+    return max(g, 1)
+
+
+def _chrono_ifg_bias(bias: th.Tensor, dim: int, T_max: int, coupled: bool = True) -> None:
+    """Chrono-style init for 3*dim IFG block: forget ~ log U(1,T), optional input = -forget."""
+    if T_max is None or T_max < 2:
+        return
+    with th.no_grad():
+        b_f = bias[dim : 2 * dim]
+        b_f.uniform_(math.log(1.5), math.log(float(T_max)))
+        if coupled:
+            bias[:dim].copy_(-b_f)
 
 
 class DWSConvLSTM2d(nn.Module):
@@ -13,11 +32,13 @@ class DWSConvLSTM2d(nn.Module):
                  dws_conv: bool = True,
                  dws_conv_only_hidden: bool = True,
                  dws_conv_kernel_size: int = 3,
-                 cell_update_dropout: float = 0.):
+                 cell_update_dropout: float = 0.,
+                 T_max_chrono_init: Optional[int] = None):
         super().__init__()
         assert isinstance(dws_conv, bool)
         assert isinstance(dws_conv_only_hidden, bool)
         self.dim = dim
+        self.T_max_chrono_init = T_max_chrono_init
 
         xh_dim = dim * 2
         gates_dim = dim * 4
@@ -32,6 +53,9 @@ class DWSConvLSTM2d(nn.Module):
                                  kernel_size=1)
         self.conv_only_hidden = dws_conv_only_hidden
         self.cell_update_dropout = nn.Dropout(p=cell_update_dropout)
+
+        if T_max_chrono_init is not None and self.conv1x1.bias is not None:
+            _chrono_ifg_bias(self.conv1x1.bias, dim, T_max_chrono_init, coupled=True)
 
     def forward(self, x: th.Tensor, h_and_c_previous: Optional[Tuple[th.Tensor, th.Tensor]] = None) \
             -> Tuple[th.Tensor, th.Tensor]:
@@ -81,22 +105,33 @@ class DWSConvSTLSTM2d(nn.Module):
     When zigzag=false, M is carried across time within each stage independently.
     When zigzag=true, M flows across layers within each time step (l-1 -> l),
     and from the last layer at t-1 to the first layer at t (zigzag connection).
+
+    Extras (PredRNN++-style training stability):
+      - 5x5 dws on h (temporal) and on m (spatial path)
+      - GroupNorm on IFG pre-activations and output path (bs=1 friendly)
+      - Chrono init on forget gates (uses T_max_chrono_init from config per stage)
     """
 
     def __init__(self,
                  dim: int,
                  dws_conv: bool = True,
                  dws_conv_only_hidden: bool = True,
-                 dws_conv_kernel_size: int = 3,
-                 cell_update_dropout: float = 0.):
+                 dws_conv_kernel_size: int = 5,
+                 dws_on_spatial_m: bool = True,
+                 cell_update_dropout: float = 0.,
+                 T_max_chrono_init: Optional[int] = None,
+                 use_group_norm: bool = True):
         super().__init__()
         assert isinstance(dws_conv, bool)
         assert isinstance(dws_conv_only_hidden, bool)
         self.dim = dim
+        self.T_max_chrono_init = T_max_chrono_init
+        self.use_group_norm = use_group_norm
 
         xh_dim = dim * 2
+        t_ch = dim * 3
 
-        # Depthwise-separable conv on h_{t-1} (reuse original design)
+        # Depthwise-separable conv on h_{t-1} (temporal path, PredRNN 5x5)
         conv3x3_dws_dim = dim if dws_conv_only_hidden else xh_dim
         self.conv3x3_dws = nn.Conv2d(
             in_channels=conv3x3_dws_dim,
@@ -104,13 +139,20 @@ class DWSConvSTLSTM2d(nn.Module):
             kernel_size=dws_conv_kernel_size,
             padding=dws_conv_kernel_size // 2,
             groups=conv3x3_dws_dim) if dws_conv else nn.Identity()
+        # Same receptive field on m_{t-1} in spatial path (separate from h)
+        self.conv3x3_dws_m = nn.Conv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=dws_conv_kernel_size,
+            padding=dws_conv_kernel_size // 2,
+            groups=dim) if (dws_conv and dws_on_spatial_m) else nn.Identity()
         self.conv_only_hidden = dws_conv_only_hidden
+        self.dws_on_spatial_m = dws_on_spatial_m
 
         # Temporal memory path: cat(x, h_{t-1}) -> i, f, g  (3 * dim)
-        self.conv1x1_temporal = nn.Conv2d(in_channels=xh_dim, out_channels=dim * 3, kernel_size=1)
-
+        self.conv1x1_temporal = nn.Conv2d(in_channels=xh_dim, out_channels=t_ch, kernel_size=1)
         # Spatial memory path: cat(x, m_{t-1}) -> i', f', g'  (3 * dim)
-        self.conv1x1_spatial = nn.Conv2d(in_channels=xh_dim, out_channels=dim * 3, kernel_size=1)
+        self.conv1x1_spatial = nn.Conv2d(in_channels=xh_dim, out_channels=t_ch, kernel_size=1)
 
         # Output gate: cat(x, h_{t-1}, C_t, M_t) -> o  (dim)
         self.conv1x1_output = nn.Conv2d(in_channels=dim * 4, out_channels=dim, kernel_size=1)
@@ -118,7 +160,21 @@ class DWSConvSTLSTM2d(nn.Module):
         # Combine C and M for hidden state: cat(C_t, M_t) -> dim
         self.conv1x1_memory = nn.Conv2d(in_channels=dim * 2, out_channels=dim, kernel_size=1)
 
+        g3 = _gn_num_groups(t_ch)
+        g_dim = _gn_num_groups(dim)
+        self.gn_temporal = nn.GroupNorm(g3, t_ch) if use_group_norm else nn.Identity()
+        self.gn_spatial = nn.GroupNorm(g3, t_ch) if use_group_norm else nn.Identity()
+        self.gn_output = nn.GroupNorm(g_dim, dim) if use_group_norm else nn.Identity()
+        self.gn_memory = nn.GroupNorm(g_dim, dim) if use_group_norm else nn.Identity()
+
         self.cell_update_dropout = nn.Dropout(p=cell_update_dropout)
+
+        # Chrono: temporal + spatial forget gates
+        if T_max_chrono_init is not None:
+            if self.conv1x1_temporal.bias is not None:
+                _chrono_ifg_bias(self.conv1x1_temporal.bias, dim, T_max_chrono_init, coupled=True)
+            if self.conv1x1_spatial.bias is not None:
+                _chrono_ifg_bias(self.conv1x1_spatial.bias, dim, T_max_chrono_init, coupled=True)
 
     def forward(self, x: th.Tensor,
                 h_and_c_previous: Optional[Tuple[th.Tensor, th.Tensor]] = None,
@@ -148,16 +204,19 @@ class DWSConvSTLSTM2d(nn.Module):
         if not self.conv_only_hidden:
             xh = self.conv3x3_dws(xh)
 
-        temporal_mix = self.conv1x1_temporal(xh)  # (N, 3*dim, H, W)
+        temporal_mix = self.conv1x1_temporal(xh)
+        temporal_mix = self.gn_temporal(temporal_mix)
         t_i, t_f, t_g = th.tensor_split(temporal_mix, 3, dim=1)
         t_i = th.sigmoid(t_i)
         t_f = th.sigmoid(t_f)
         t_g = self.cell_update_dropout(th.tanh(t_g))
         c_t = t_f * c_tm1 + t_i * t_g
 
-        # --- Spatial memory M update ---
-        xm = th.cat((x, m_tm1), dim=1)
-        spatial_mix = self.conv1x1_spatial(xm)  # (N, 3*dim, H, W)
+        # --- Spatial memory M update (5x5 dws on m when enabled) ---
+        m_in = self.conv3x3_dws_m(m_tm1)
+        xm = th.cat((x, m_in), dim=1)
+        spatial_mix = self.conv1x1_spatial(xm)
+        spatial_mix = self.gn_spatial(spatial_mix)
         s_i, s_f, s_g = th.tensor_split(spatial_mix, 3, dim=1)
         s_i = th.sigmoid(s_i)
         s_f = th.sigmoid(s_f)
@@ -165,9 +224,13 @@ class DWSConvSTLSTM2d(nn.Module):
         m_t = s_f * m_tm1 + s_i * s_g
 
         # --- Output gate (combines all four sources) ---
-        o_t = th.sigmoid(self.conv1x1_output(th.cat((x, h_tm1, c_t, m_t), dim=1)))
+        o_preact = self.conv1x1_output(th.cat((x, h_tm1, c_t, m_t), dim=1))
+        o_preact = self.gn_output(o_preact)
+        o_t = th.sigmoid(o_preact)
 
         # --- Hidden state from combined memories ---
-        h_t = o_t * th.tanh(self.conv1x1_memory(th.cat((c_t, m_t), dim=1)))
+        mem = self.conv1x1_memory(th.cat((c_t, m_t), dim=1))
+        mem = self.gn_memory(mem)
+        h_t = o_t * th.tanh(mem)
 
         return h_t, c_t, m_t

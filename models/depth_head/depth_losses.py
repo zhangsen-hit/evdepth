@@ -257,6 +257,58 @@ class DepthLoss(nn.Module):
         log_depth_clamped = torch.clamp(log_depth, min=self._log_depth_min, max=self._log_depth_max)
         return (log_depth_clamped - self._log_depth_min) / max(self._log_depth_denom, 1e-6)
 
+    @staticmethod
+    def _masked_avg_pool_to_size(
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        out_hw,
+    ):
+        """Masked adaptive average pooling to arbitrary output size.
+
+        设 sum_m  = pool(mask_float)      （块内有效像素占比）
+           sum_tm = pool(target*mask_float)
+        则 target_down = sum_tm / sum_m  在有效块处取值，其余位置置 0；
+           mask_down    = (sum_m > 0)    （块内至少一个有效像素）。
+
+        - 使用 adaptive_avg_pool2d，兼容非整数下采样比（如 260→65, 348→44 等）。
+        - 强制 fp32 计算，避免 AMP/fp16 下分母过小导致的数值问题。
+        - 若未提供 mask，则退化为普通 adaptive avg pool（返回 mask_down=None）。
+
+        Args:
+            target: (B, 1, H, W) 在 [0, 1] 的 norm_log 空间。
+            mask:   (B, 1, H, W) bool 或浮点 0/1，或 None。
+            out_hw: 目标 (h, w)。
+
+        Returns:
+            target_down: (B, 1, h, w) 与 target 同 dtype。
+            mask_down:   (B, 1, h, w) bool；无输入 mask 时返回 None。
+        """
+        out_hw = tuple(out_hw)
+        src_dtype = target.dtype
+        device_type = target.device.type
+
+        # 跳过 AMP，避免 fp16 下 1/den 的数值敏感问题
+        autocast_enabled = torch.is_autocast_enabled() if device_type == 'cuda' else False
+
+        def _compute():
+            t32 = target.float()
+            if mask is None:
+                out = F.adaptive_avg_pool2d(t32, output_size=out_hw)
+                return out.to(src_dtype), None
+            m32 = (mask.to(torch.float32) if mask.dtype != torch.float32 else mask.float())
+            num = F.adaptive_avg_pool2d(t32 * m32, output_size=out_hw)
+            den = F.adaptive_avg_pool2d(m32, output_size=out_hw)
+            mask_down = den > 0.0
+            # den=0 处 num 也=0；先 clamp 再 where，避免 0/0 造 NaN
+            t_down = num / den.clamp(min=1e-6)
+            t_down = torch.where(mask_down, t_down, torch.zeros_like(t_down))
+            return t_down.to(src_dtype), mask_down
+
+        if autocast_enabled:
+            with torch.amp.autocast(device_type=device_type, enabled=False):
+                return _compute()
+        return _compute()
+
     # def forward(self, predictions: dict, target: torch.Tensor, mask: torch.Tensor = None):
     #     """
     #     Args:
@@ -320,49 +372,49 @@ class DepthLoss(nn.Module):
 
     def forward(self, predictions, target, mask=None):
         """
-        多尺度深度 loss（稀疏 GT 友好版本）。
+        多尺度深度 loss（方案 A：masked avg pool 下采样稀疏 GT / mask）。
 
-        关键原则（参考 Monodepth2）：不下采样稀疏 GT，而是把各尺度预测统一上采样到 GT
-        的原始分辨率，只在原始高分辨率 mask 的有效点上计算 loss。这样做的好处：
-        1) 不丢失本就稀疏的激光雷达有效点；
-        2) 不把"无效值"随下采样扩散到更大范围（否则近地面的无效区会越来越大，
-           与天空成片无效混淆，导致近地面被错估为远处并出现条纹状伪影）；
-        3) 低分辨率层也能受到原分辨率 GT 的高频精确监督。
-
-        E2Depth 修正（重要）：
-        - SILog 主损失仍在多个 decoder 输出尺度上监督（auxiliary supervision，不变）。
-        - gradient loss 不再对每个 decoder 头分别计算，而是只对最终（最高分辨率）预测
-          `depth_2` 计算一次 E2Depth 风格多尺度 residual gradient loss。
+        设计要点：
+        1) 每个 decoder 输出头的 SILog 主损失，在**该头自己的分辨率**上计算。
+           GT 与 mask 通过 *masked average pooling* 下采样到对应分辨率：
+           - 对 `target * mask` 和 `mask` 分别做 adaptive_avg_pool2d，
+             再用前者除以后者，得到"块内仅对有效像素求均值"的下采样 target；
+           - 新 mask 取 "块内至少一个有效像素"，避免无效区随下采样扩散。
+           这样做的好处：
+             - 稀疏 LiDAR 点不会因下采样而完全丢失（只要块内有 1 点就保留）；
+             - 低分辨率头只被要求匹配"局部平均深度"，与其表达能力相匹配，
+               不会像 "pred 上采样 → 与 /1 稀疏 GT 对齐" 那样被迫学邻域均值
+               从而通过 decoder 反向污染高分辨率头，导致输出整体偏糊。
+        2) gradient loss 仍走 E2Depth 风格：只对最精细输出（depth_2）上采样到 /1
+           后计算一次 residual gradient loss（内部在 residual 的多个下采样尺度上累加）。
         """
         total_loss = torch.zeros((), device=target.device, dtype=target.dtype)
         losses_dict = {}
 
-        # GT 和 mask 固定在输入（高）分辨率，全程不下采样
         target_hw = target.shape[-2:]
         target_norm_log = torch.clamp(target, 0.0, 1.0)
         if mask is not None and mask.dtype != torch.bool:
             mask = mask.bool()
 
-        # ---- (1) SILog 主损失：保留原有多尺度 decoder 头监督 ----
+        # ---- (1) SILog 主损失：每层 pred 对齐自己分辨率的 masked-pool target/mask ----
         for scale in self.scales:
             key = f'depth_{scale}'
             if key not in predictions:
                 continue
 
             pred = predictions[key]
+            pred_hw = pred.shape[-2:]
+            pred_norm_log = torch.clamp(pred, 0.0, 1.0)
 
-            # 双线性上采样预测到 GT 的原始分辨率（不是把 GT 降到 pred 分辨率）
-            if pred.shape[-2:] != target_hw:
-                pred_up = F.interpolate(
-                    pred, size=target_hw, mode='bilinear', align_corners=False
-                )
+            if pred_hw == target_hw:
+                tgt_for_silog = target_norm_log
+                mask_for_silog = mask
             else:
-                pred_up = pred
+                tgt_for_silog, mask_for_silog = self._masked_avg_pool_to_size(
+                    target_norm_log, mask, pred_hw
+                )
 
-            # pred/target 均已在 norm_log 空间，直接计算
-            pred_norm_log = torch.clamp(pred_up, 0.0, 1.0)
-
-            silog = self.silog_loss(pred_norm_log, target_norm_log, mask)
+            silog = self.silog_loss(pred_norm_log, tgt_for_silog, mask_for_silog)
             scale_loss = self.silog_weight * silog
 
             scale_weight = 1.0 / scale  # 高分辨率头权重更大
@@ -388,6 +440,5 @@ class DepthLoss(nn.Module):
             total_loss = total_loss + self.grad_weight * grad_multiscale
             losses_dict['grad_multiscale'] = grad_multiscale.detach()
 
-        # 总损失必须保持梯度信息，不能 detach
         losses_dict['loss'] = total_loss
         return total_loss, losses_dict

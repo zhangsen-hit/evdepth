@@ -23,8 +23,8 @@ dataset:
   # 多场景划分：指定哪些场景用于训练、哪些用于验证
   # path 下应包含以场景名命名的子目录（如 00/, 01/, ...），每个子目录含 index.txt + npz
   # train_scenes: ["00","01","02"]
-  train_scenes: ["01","02","03","04","05","06","07","08","09"]
-  val_scenes: ["00"]
+  train_scenes: ["00","01","02","04"]
+  val_scenes: ["03"]
   
   # 单场景回退：若不配置 train_scenes/val_scenes，则 path 下直接含 index.txt，
   # 按 train_ratio 比例划分 train/val
@@ -116,12 +116,15 @@ model:
       patch_size: 4
     stage:
       lstm:
-        cell_type: convlstm    # 'convlstm' or 'stlstm'
-        zigzag: true          # ST-LSTM cross-layer M routing (requires cell_type: stlstm)
-        dws_conv: False
-        dws_conv_only_hidden: True
-        dws_conv_kernel_size: 3
-        drop_cell_update: 0
+        # PredRNN ST-LSTM + zigzag：5x5 DWS + GroupNorm + chrono(T_max per stage) + 适配器稳定化
+        cell_type: stlstm
+        zigzag: true
+        dws_conv: true
+        dws_conv_only_hidden: true
+        dws_conv_kernel_size: 5
+        dws_on_spatial_m: true
+        use_group_norm: true
+        drop_cell_update: 0.1
   
   fpn:
     name: PAFPN
@@ -160,18 +163,19 @@ model:
 # 训练配置
 # ----------------------------------------------------------------------------
 training:
+  # ST-LSTM+zigzag 参数与 M 跨层路由更敏感：略降 lr、略增 wd、pct_start 利于前期稳定
   precision: "16-mixed"
   max_epochs: 1000
   max_steps: 70000
-  learning_rate: 0.0002
-  weight_decay: 0.0001
+  learning_rate: 0.0001
+  weight_decay: 0.0005
   gradient_clip_val: 1.0
   limit_train_batches: 1.0
   
   lr_scheduler:
     use: True
     total_steps: 70000
-    pct_start: 0.1
+    pct_start: 0.2
     div_factor: 25
     final_div_factor: 10000
 

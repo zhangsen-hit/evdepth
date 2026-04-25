@@ -20,3 +20,7 @@ step 调到7万，序列调到12，结果似乎没有变化。delta1 0.4， rmse
 2026-04-23 12:40
 了解到gradient loss竟然写错了，先改动这个看看情况
 训练 7万 step ，77个epoch，训练集上尽管特别细节的树条还没学好，但是整体已经非常牛逼了。验证集因为选的不好，效果看不是很清晰
+yan zheng ji hai shi huan hui 04
+调优过了masked 下采样
+pao ge baseline kaishi tiaoyou stlstm
+这个baseline在00 01 02 03 04 这个数据集上跑出来的结果非常好（主要是训练集）
