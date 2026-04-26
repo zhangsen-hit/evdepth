@@ -73,22 +73,22 @@ class DepthDecoder(nn.Module):
         conv3_in = 64 + (skip_quarter_channels or 0)
         self.conv3 = nn.Sequential(
             nn.Conv2d(conv3_in, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             self.act,
             nn.Conv2d(64, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             self.act,
         )
         
         # Upsample to /2
         self.up4 = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             self.act,
         )
         self.conv4 = nn.Sequential(
             nn.Conv2d(32, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),
             self.act,
         )
         
@@ -98,6 +98,14 @@ class DepthDecoder(nn.Module):
         self.depth_head_2 = nn.Conv2d(128, out_channels, 1)  # at /8
         self.depth_head_3 = nn.Conv2d(64, out_channels, 1)   # at /4
         self.depth_head_4 = nn.Conv2d(32, out_channels, 1)   # at /2
+
+        # /2 -> /1：深度可分离卷积 + PixelShuffle，参数量与 FLOPs 增量极小
+        self.to_full_res = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
+            nn.Conv2d(32, 4, 1, bias=False),
+            nn.PixelShuffle(2),
+            nn.Sigmoid(),
+        )
         
     def forward(
         self,
@@ -157,13 +165,15 @@ class DepthDecoder(nn.Module):
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)  # /4 -> /2
         x = self.conv4(x)  # -> 32
         depth_2 = torch.sigmoid(self.depth_head_4(x))  # Depth at /2
-        
+        depth_1 = self.to_full_res(x)  # (B,1,H,W) full resolution, norm_log
+
         # Return multi-scale depth predictions (all in normalized log space)
         outputs = {
             'depth_16': depth_16,  # 1/16 resolution
             'depth_8': depth_8,    # 1/8 resolution
             'depth_4': depth_4,    # 1/4 resolution
-            'depth_2': depth_2,    # 1/2 resolution (finest)
+            'depth_2': depth_2,    # 1/2 resolution
+            'depth_1': depth_1,    # 1/1 resolution (finest)
         }
         
         return outputs

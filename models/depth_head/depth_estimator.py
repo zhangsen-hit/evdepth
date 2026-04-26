@@ -60,11 +60,15 @@ class DepthEstimator(th.nn.Module):
             silog_weight=loss_cfg.get("silog_weight", 1.0),
             grad_weight=loss_cfg.get("grad_weight", 0.5),
             silog_lambda=loss_cfg.get("silog_lambda", 0.5),
-            scales=loss_cfg.get("scales", [2, 4, 8, 16]),
+            scales=loss_cfg.get("scales", [1, 2, 4, 8, 16]),
             depth_min=min_depth,
             depth_max=max_depth,
             far_weight_alpha=far_weight_cfg.get("alpha", 0.0),
             far_weight_t0=far_weight_cfg.get("t0", 0.3),
+            lap_weight=loss_cfg.get("lap_weight", 0.3),
+            event_edge_sigma=loss_cfg.get("event_edge_sigma", 3.0),
+            event_edge_grad_ratio=loss_cfg.get("event_edge_grad_ratio", 0.5),
+            scale1_weight_mul=loss_cfg.get("scale1_weight_mul", 2.5),
         )
 
     def forward_backbone(
@@ -83,6 +87,7 @@ class DepthEstimator(th.nn.Module):
         backbone_features: BackboneFeatures,
         targets: Optional[th.Tensor] = None,
         masks: Optional[th.Tensor] = None,
+        event_repr: Optional[th.Tensor] = None,
     ) -> Tuple[Dict[str, th.Tensor], Union[Dict[str, th.Tensor], None]]:
         """
         Forward through FPN and depth head
@@ -109,7 +114,9 @@ class DepthEstimator(th.nn.Module):
         losses = None
         if targets is not None:
             with CudaTimer(device=device, timer_name="Depth Loss"):
-                total_loss, losses_dict = self.loss_fn(predictions, targets, masks)
+                total_loss, losses_dict = self.loss_fn(
+                    predictions, targets, masks, event_repr
+                )
                 losses = losses_dict
 
         return predictions, losses
@@ -152,10 +159,12 @@ class DepthEstimator(th.nn.Module):
             assert targets is None
             return predictions, losses, states
 
+        event_repr = x if targets is not None else None
         predictions, losses = self.forward_depth(
             backbone_features=backbone_features,
             targets=targets,
             masks=masks,
+            event_repr=event_repr,
         )
 
         return predictions, losses, states

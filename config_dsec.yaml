@@ -120,7 +120,11 @@ model:
     silog_weight: 1.0
     grad_weight: 0.5
     silog_lambda: 0.5
-    scales: [2, 4, 8, 16]
+    scales: [1, 2, 4, 8, 16]
+    lap_weight: 0.3
+    event_edge_sigma: 3.0
+    event_edge_grad_ratio: 0.5
+    scale1_weight_mul: 2.5
   
   # 深度范围 (根据DSEC调整)
   depth_range:

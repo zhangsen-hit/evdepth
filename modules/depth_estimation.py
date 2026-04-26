@@ -22,6 +22,13 @@ from modules.data.rnn_states_across_batches import RNNStates
 from models.depth_head.depth_estimator import DepthEstimator
 
 
+def _finest_depth_pred(predictions: Dict[str, th.Tensor]) -> th.Tensor:
+    """有全分辨率头时用 depth_1，否则为 depth_2。"""
+    if predictions is None:
+        raise TypeError("predictions must not be None")
+    return predictions.get("depth_1", predictions["depth_2"])
+
+
 class DepthOutput:
     """Output keys for depth estimation"""
     DEPTH_PRED = 'depth_pred'
@@ -258,7 +265,7 @@ class Module(pl.LightningModule):
                 losses_dict[k] = losses_dict[k] / num_valid_frames
         
         # Use last frame for visualization and evaluation
-        depth_pred_viz = predictions['depth_2']  # Finest resolution (e.g. 1/2 of input)
+        depth_pred_viz = _finest_depth_pred(predictions)
         depth_gt_viz_log = depth_gt_sequence[-1].to(dtype=self.dtype)
         depth_gt_viz_log = self.input_padder.pad_tensor_ev_repr(depth_gt_viz_log)
         depth_gt_viz = self.log_depth_to_norm_log_depth(depth_gt_viz_log)
@@ -438,7 +445,7 @@ class Module(pl.LightningModule):
                 )
 
             # 收集当前时间步用于可视化（仅取 batch 内第 0 个样本）
-            pred_t = predictions['depth_2']  # (B, 1, H', W')
+            pred_t = _finest_depth_pred(predictions)  # (B, 1, H', W')
             viz_hw = tuple(ev_tensor_sequence[tidx][0].shape[-2:])
             depth_pred_for_viz_t = F.interpolate(
                 pred_t,
@@ -476,7 +483,7 @@ class Module(pl.LightningModule):
             self.test_rnn_states.save_states_and_detach(worker_id=worker_id, states=prev_states)
         
         # Use last frame for evaluation
-        depth_pred = predictions['depth_2']  # Finest resolution (1/2 of input, e.g. 120x160)
+        depth_pred = _finest_depth_pred(predictions)
         # Pad GT and mask to input size
         depth_gt = depth_gt_sequence[-1].to(dtype=self.dtype)
         depth_gt = self.input_padder.pad_tensor_ev_repr(depth_gt)

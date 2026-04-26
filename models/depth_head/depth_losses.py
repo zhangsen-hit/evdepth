@@ -7,6 +7,8 @@ Includes SILog (Scale-Invariant Log) and image gradient loss
 - 本文件会在 loss 计算之前，把 `pred` 和 `target` 都转换到
   “归一化 log(depth)（min_depth=0.5, max_depth=80）”空间，再计算误差。
 """
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -205,6 +207,45 @@ class MultiScaleGradientLoss(nn.Module):
         return total_loss / total_count.clamp(min=1.0)
 
 
+class LaplacianLoss(nn.Module):
+    """对归一化 log 深度作 Laplacian 匹配，加强深度不连续处的二阶监督（仅训练期）。"""
+
+    def __init__(self):
+        super().__init__()
+        k = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer("kernel", k, persistent=True)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None):
+        k = self.kernel.to(device=pred.device, dtype=pred.dtype)
+        lap_p = F.conv2d(pred, k, padding=1)
+        lap_t = F.conv2d(target, k, padding=1)
+        diff = (lap_p - lap_t).abs()
+        if mask is not None:
+            m = mask
+            if m.dtype != torch.bool:
+                m = m.bool()
+            if m.shape != diff.shape:
+                m = m.expand_as(diff)
+            diff = diff[m]
+        if diff.numel() == 0:
+            return pred.new_tensor(0.0)
+        return diff.mean()
+
+
+def event_edge_weight(event_repr: torch.Tensor, sigma: float = 3.0) -> torch.Tensor:
+    """
+    从事件表示得到边缘权重图：活动强处权重大。返回 (B, 1, H, W)，值域约 [1, 1+sigma]。
+    """
+    with torch.no_grad():
+        activity = event_repr.abs().sum(dim=1, keepdim=True).float()
+        b = activity.shape[0]
+        a_max = activity.view(b, -1).max(dim=1).values.view(b, 1, 1, 1).clamp(min=1e-6)
+        activity = activity / a_max
+        return 1.0 + float(sigma) * activity
+
+
 class DepthLoss(nn.Module):
     """
     Combined multi-scale depth loss
@@ -215,16 +256,24 @@ class DepthLoss(nn.Module):
         silog_weight: float = 1.0,
         grad_weight: float = 0.5,
         silog_lambda: float = 0.5,
-        scales: list = [2, 4, 8, 16],  # Multi-scale outputs
+        scales: list = [1, 2, 4, 8, 16],  # Multi-scale outputs
         depth_min: float = 0.5,
         depth_max: float = 80.0,
         far_weight_alpha: float = 0.0,
         far_weight_t0: float = 0.3,
+        lap_weight: float = 0.0,
+        event_edge_sigma: float = 3.0,
+        event_edge_grad_ratio: float = 0.5,
+        scale1_weight_mul: float = 1.0,
     ):
         super().__init__()
         self.silog_weight = silog_weight
         self.grad_weight = grad_weight
         self.scales = scales
+        self.lap_weight = float(lap_weight)
+        self.event_edge_sigma = float(event_edge_sigma)
+        self.event_edge_grad_ratio = float(event_edge_grad_ratio)
+        self.scale1_weight_mul = float(scale1_weight_mul)
         self.depth_min = float(depth_min)
         self.depth_max = float(depth_max)
 
@@ -246,6 +295,7 @@ class DepthLoss(nn.Module):
         # E2Depth 风格：gradient loss 只作用在最终（最高分辨率）预测的 residual 上，
         # 并在 residual 的多个下采样尺度上累计（默认 4 个尺度）。
         self.grad_loss = MultiScaleGradientLoss(num_scales=4)
+        self.lap_loss = LaplacianLoss()
 
     def log_depth_to_norm_log_depth(self, log_depth: torch.Tensor) -> torch.Tensor:
         """
@@ -370,7 +420,13 @@ class DepthLoss(nn.Module):
         
     #     return total_loss, losses_dict
 
-    def forward(self, predictions, target, mask=None):
+    def forward(
+        self,
+        predictions,
+        target,
+        mask=None,
+        event_repr: Optional[torch.Tensor] = None,
+    ):
         """
         多尺度深度 loss（方案 A：masked avg pool 下采样稀疏 GT / mask）。
 
@@ -385,8 +441,9 @@ class DepthLoss(nn.Module):
              - 低分辨率头只被要求匹配"局部平均深度"，与其表达能力相匹配，
                不会像 "pred 上采样 → 与 /1 稀疏 GT 对齐" 那样被迫学邻域均值
                从而通过 decoder 反向污染高分辨率头，导致输出整体偏糊。
-        2) gradient loss 仍走 E2Depth 风格：只对最精细输出（depth_2）上采样到 /1
-           后计算一次 residual gradient loss（内部在 residual 的多个下采样尺度上累加）。
+        2) E2Depth 多尺度 gradient loss：对**最精细**预测（有 depth_1 则用全分辨率，否则
+           depth_2 双线性上采样到 /1）与 /1 的 GT 算 residual 的多尺度梯度项。
+        3) 可选：Laplacian 项在 scale 1/2 与事件边缘加权的额外交叉梯度项（仅训练期）。
         """
         total_loss = torch.zeros((), device=target.device, dtype=target.dtype)
         losses_dict = {}
@@ -417,13 +474,19 @@ class DepthLoss(nn.Module):
             silog = self.silog_loss(pred_norm_log, tgt_for_silog, mask_for_silog)
             scale_loss = self.silog_weight * silog
 
-            scale_weight = 1.0 / scale  # 高分辨率头权重更大
+            if self.lap_weight > 0.0 and scale <= 2:
+                lap = self.lap_loss(pred_norm_log, tgt_for_silog, mask_for_silog)
+                scale_loss = scale_loss + self.lap_weight * lap
+                losses_dict[f'lap_{scale}'] = lap.detach()
+
+            scale_weight = 1.0 / float(scale)  # 高分辨率头基础权重更大
+            if scale == 1 and self.scale1_weight_mul != 1.0:
+                scale_weight = scale_weight * self.scale1_weight_mul
             total_loss = total_loss + scale_weight * scale_loss
 
             losses_dict[f'silog_{scale}'] = silog.detach()
 
-        # ---- (2) E2Depth 多尺度 gradient loss：仅作用于最终最高分辨率预测 ----
-        # 约定最精细 decoder 输出头（scales 里最小的那个，一般是 depth_2）作为 pred_final。
+        # ---- (2) E2Depth 多尺度 gradient loss：最精细预测 + 可选事件边缘加权 ----
         finest_scale = min(self.scales) if len(self.scales) > 0 else None
         finest_key = f'depth_{finest_scale}' if finest_scale is not None else None
         if finest_key is not None and finest_key in predictions:
@@ -439,6 +502,24 @@ class DepthLoss(nn.Module):
             )
             total_loss = total_loss + self.grad_weight * grad_multiscale
             losses_dict['grad_multiscale'] = grad_multiscale.detach()
+
+            if (
+                event_repr is not None
+                and self.event_edge_grad_ratio > 0.0
+            ):
+                edge_w = event_edge_weight(event_repr, sigma=self.event_edge_sigma)
+                if edge_w.shape[-2:] != target_hw:
+                    edge_w = F.interpolate(
+                        edge_w, size=target_hw, mode="nearest"
+                    )
+                g_edge = self.grad_loss(
+                    pred_final_norm_log * edge_w,
+                    target_norm_log * edge_w,
+                    mask,
+                )
+                w_edge = self.grad_weight * self.event_edge_grad_ratio
+                total_loss = total_loss + w_edge * g_edge
+                losses_dict['grad_multiscale_event_edge'] = g_edge.detach()
 
         losses_dict['loss'] = total_loss
         return total_loss, losses_dict

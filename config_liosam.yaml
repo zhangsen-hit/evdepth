@@ -146,7 +146,11 @@ model:
     silog_weight: 1.0
     grad_weight: 0.5
     silog_lambda: 0.5
-    scales: [2, 4, 8, 16]
+    scales: [1, 2, 4, 8, 16]
+    lap_weight: 0.3
+    event_edge_sigma: 3.0
+    event_edge_grad_ratio: 0.5
+    scale1_weight_mul: 2.5
     # 远距软加权（只作用在 SILog 上，权重由 target 计算并 detach）
     # w = 1 + alpha * clamp((t_norm - t0) / (1 - t0), 0, 1)
     # alpha=0 时严格等价于原 loss，便于 A/B 对比
