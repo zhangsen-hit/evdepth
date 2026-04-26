@@ -3,7 +3,7 @@ Depth estimation head with UNet-style decoder
 Takes FPN features and progressively upsamples with skip connections
 Outputs depth in log space
 """
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,9 +19,11 @@ class DepthDecoder(nn.Module):
         in_channels: Tuple[int, int, int] = (256, 512, 1024),  # FPN output channels (low to high res)
         out_channels: int = 1,  # depth is single channel
         act: str = "relu",
+        skip_quarter_channels: Optional[int] = None,
     ):
         super().__init__()
         self.in_channels = in_channels  # (256, 512, 1024) for /8, /16, /32
+        self.skip_quarter_channels = skip_quarter_channels
         
         # Activation function
         if act == "relu":
@@ -68,8 +70,9 @@ class DepthDecoder(nn.Module):
             nn.BatchNorm2d(64),
             self.act,
         )
+        conv3_in = 64 + (skip_quarter_channels or 0)
         self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
+            nn.Conv2d(conv3_in, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             self.act,
             nn.Conv2d(64, 64, 3, padding=1),
@@ -96,11 +99,17 @@ class DepthDecoder(nn.Module):
         self.depth_head_3 = nn.Conv2d(64, out_channels, 1)   # at /4
         self.depth_head_4 = nn.Conv2d(32, out_channels, 1)   # at /2
         
-    def forward(self, fpn_features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+    def forward(
+        self,
+        fpn_features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        feat_skip_quarter: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             fpn_features: tuple of (feat_low, feat_mid, feat_high)
                          corresponding to /8, /16, /32 resolutions
+            feat_skip_quarter: optional backbone stage-1 feature after RNN (/4), concatenated
+                               before the /4 refinement convs (same as FPN /8 upsampled to /4).
         Returns:
             depth_outputs: dict with multiple scale depth predictions in log space
         """
@@ -128,6 +137,18 @@ class DepthDecoder(nn.Module):
         # Upsample to /4
         x = self.up3(x)  # 128 -> 64
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)  # /8 -> /4
+        if self.skip_quarter_channels is not None:
+            assert feat_skip_quarter is not None, (
+                "feat_skip_quarter is required when skip_quarter_channels is set"
+            )
+            if feat_skip_quarter.shape[-2:] != x.shape[-2:]:
+                feat_skip_quarter = F.interpolate(
+                    feat_skip_quarter,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            x = torch.cat([x, feat_skip_quarter], dim=1)
         x = self.conv3(x)  # -> 64
         depth_4 = torch.sigmoid(self.depth_head_3(x))  # Depth at /4
         
@@ -148,11 +169,16 @@ class DepthDecoder(nn.Module):
         return outputs
 
 
-def build_depth_head(head_cfg, in_channels: Tuple[int, int, int]):
+def build_depth_head(
+    head_cfg,
+    in_channels: Tuple[int, int, int],
+    skip_quarter_channels: Optional[int] = None,
+):
     """Build depth estimation head"""
     return DepthDecoder(
         in_channels=in_channels,
         out_channels=1,
-        act=head_cfg.get('act', 'relu')
+        act=head_cfg.get('act', 'relu'),
+        skip_quarter_channels=skip_quarter_channels,
     )
 

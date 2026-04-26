@@ -46,8 +46,11 @@ class DepthEstimator(th.nn.Module):
         in_channels = self.backbone.get_stage_dims(tuple(fpn_cfg["in_stages"]))
         self.fpn = build_yolox_fpn(fpn_cfg, in_channels=in_channels)
 
-        # Build depth estimation head (replaces YOLOX head)
-        self.depth_head = build_depth_head(head_cfg, in_channels=in_channels)
+        # Stage-1 (/4) RNN output as decoder skip at /4 (FPN only feeds stages 2–4)
+        skip_quarter_ch = self.backbone.get_stage_dims((1,))[0]
+        self.depth_head = build_depth_head(
+            head_cfg, in_channels=in_channels, skip_quarter_channels=skip_quarter_ch
+        )
 
         # Build loss function
         far_weight_cfg = loss_cfg.get("far_weight", {}) or {}
@@ -99,7 +102,9 @@ class DepthEstimator(th.nn.Module):
             fpn_features = self.fpn(backbone_features)
 
         with CudaTimer(device=device, timer_name="Depth Head"):
-            predictions = self.depth_head(fpn_features)
+            predictions = self.depth_head(
+                fpn_features, feat_skip_quarter=backbone_features[1]
+            )
 
         losses = None
         if targets is not None:
