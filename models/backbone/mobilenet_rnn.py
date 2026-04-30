@@ -75,18 +75,22 @@ class MobileNetRNNStage(nn.Module):
         self.spatial_downsample_factor = spatial_downsample_factor
         self.stage_idx = stage_idx
 
-        # Downsampling layer
-        if stage_idx == 0:
-            # First stage: patch embedding
-            kernel_size = spatial_downsample_factor
-            stride = spatial_downsample_factor
-            padding = 0
-        else:
-            # Subsequent stages: strided conv
+        # Downsampling / channel-projection layer
+        if spatial_downsample_factor == 1:
+            # Pure channel projection (no spatial downsampling)
+            kernel_size = 3
+            stride = 1
+            padding = 1
+        elif spatial_downsample_factor == 2:
             kernel_size = 2
             stride = 2
             padding = 0
-        
+        else:
+            # General fallback: kxk strided conv (preserves legacy patch-embed behavior)
+            kernel_size = spatial_downsample_factor
+            stride = spatial_downsample_factor
+            padding = 0
+
         self.downsample = nn.Sequential(
             nn.Conv2d(dim_in, stage_dim, kernel_size=kernel_size,
                       stride=stride, padding=padding, bias=False),
@@ -237,6 +241,18 @@ class MobileNetRNN(BaseDetector):
         input_dim = in_channels
         stem_cfg = mdl_config.get('stem', {})
         patch_size = stem_cfg.get('patch_size', 4) if isinstance(stem_cfg, dict) else 4
+        # Per-stage spatial downsample factors. If `downsample_factors` is
+        # provided in config, it takes precedence; otherwise fall back to the
+        # legacy [patch_size, 2, 2, ...] schedule.
+        downsample_factors_cfg = mdl_config.get('downsample_factors', None)
+        if downsample_factors_cfg is not None:
+            downsample_factors = [int(f) for f in downsample_factors_cfg]
+            assert len(downsample_factors) == num_stages, (
+                f"downsample_factors must have length {num_stages}, "
+                f"got {len(downsample_factors)}"
+            )
+        else:
+            downsample_factors = [patch_size] + [2] * (num_stages - 1)
         stride = 1
         self.stage_dims = [embed_dim * x for x in dim_multiplier_per_stage]
 
@@ -245,11 +261,11 @@ class MobileNetRNN(BaseDetector):
 
         self.stages = nn.ModuleList()
         self.strides = []
-        
+
         for stage_idx, (num_blocks, T_max_chrono_init_stage) in \
                 enumerate(zip(num_blocks_per_stage, T_max_chrono_init_per_stage)):
-            
-            spatial_downsample_factor = patch_size if stage_idx == 0 else 2
+
+            spatial_downsample_factor = downsample_factors[stage_idx]
             stage_dim = self.stage_dims[stage_idx]
             enable_masking_in_stage = enable_masking and stage_idx == 0
             
@@ -336,25 +352,23 @@ class MobileNetRNN(BaseDetector):
             features: Dict of features from each stage
             states: Tuple of LSTM states
         """
-        # Automatic padding to ensure dimensions are divisible by 32
+        # Automatic padding to ensure dimensions are divisible by max stride
+        max_stride = self.strides[-1]
         h, w = x.shape[2:]
-        pad_h = (32 - h % 32) % 32
-        pad_w = (32 - w % 32) % 32
+        pad_h = (max_stride - h % max_stride) % max_stride
+        pad_w = (max_stride - w % max_stride) % max_stride
         if pad_h > 0 or pad_w > 0:
             x = th.nn.functional.pad(x, (0, pad_w, 0, pad_h))
-        
+
         if prev_states is None:
             prev_states = [None] * len(self.stages)
-        
+
         features = {}
         states = []
-        
-        # Expected output sizes for each stage
+
+        # Expected output sizes for each stage (derived from per-stage strides)
         expected_hw_list = [
-            (x.size(2)//4, x.size(3)//4),    # Stage 1: /4
-            (x.size(2)//8, x.size(3)//8),    # Stage 2: /8
-            (x.size(2)//16, x.size(3)//16),  # Stage 3: /16
-            (x.size(2)//32, x.size(3)//32),  # Stage 4: /32
+            (x.size(2) // s, x.size(3) // s) for s in self.strides
         ]
         
         # --- Zigzag: extract M from last stage at previous time step ---

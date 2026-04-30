@@ -107,13 +107,17 @@ model:
         mode: reduce-overhead
     input_channels: 2   # 事件张量 2*260*346
     enable_masking: False
-    embed_dim: 64
+    # Channels per stage: 32, 64, 128, 256 (= embed_dim * dim_multiplier)
+    embed_dim: 32
     dim_multiplier: [1, 2, 4, 8]
+    # Per-stage spatial downsample factors: stages produce features at /1, /2, /4, /8
+    downsample_factors: [1, 2, 2, 2]
     num_blocks: [2, 2, 2, 2]
     T_max_chrono_init: [4, 8, 16, 32]
-    in_res_hw: [260, 348]  # 346→348 满足 token mask padding 要求 (W%4==0)
+    # 264 = 260+4, 352 = 346+6: pad raw (260, 346) to next multiple of 8 (max stride)
+    in_res_hw: [264, 352]
     stem:
-      patch_size: 4
+      patch_size: 4   # unused when downsample_factors is set; kept for backward compat
     stage:
       lstm:
         # PredRNN ST-LSTM + zigzag：5x5 DWS + GroupNorm + chrono(T_max per stage) + 适配器稳定化
@@ -126,27 +130,22 @@ model:
         use_group_norm: true
         drop_cell_update: 0.1
   
+  # PAFPN 暂时弃用：backbone 特征图直接送到 depth head（no_fpn 模式）
   fpn:
-    name: PAFPN
-    compile:
-      enable: False
-      args:
-        mode: reduce-overhead
-    depth: 0.67
-    in_stages: [2, 3, 4]
-    depthwise: False
-    act: "silu"
-  
+    name: none
+
   head:
     name: depth_head
+    mode: no_fpn   # 与 fpn.name=none 配合：直接消费 backbone 4 个分辨率特征
     act: relu
-  
+
   loss:
     berhu_weight: 1.0
     silog_weight: 1.0
     grad_weight: 0.5
     silog_lambda: 0.5
-    scales: [1, 2, 4, 8, 16]
+    # 当前 head 仅产出 /1, /2, /4 三种分辨率预测；其余 scale key 不存在会被自动跳过
+    scales: [1, 2, 4]
     lap_weight: 0.3
     event_edge_sigma: 3.0
     event_edge_grad_ratio: 0.5

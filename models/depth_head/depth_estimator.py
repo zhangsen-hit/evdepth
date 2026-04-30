@@ -42,15 +42,31 @@ class DepthEstimator(th.nn.Module):
         # Build backbone
         self.backbone = build_recurrent_backbone(backbone_cfg)
 
-        # Build FPN
-        in_channels = self.backbone.get_stage_dims(tuple(fpn_cfg["in_stages"]))
-        self.fpn = build_yolox_fpn(fpn_cfg, in_channels=in_channels)
+        # Decide whether to build a PAFPN. When `fpn.name` is one of
+        # {None, 'none', 'None', 'identity'} (case-insensitive), the backbone
+        # features are routed directly to the depth head (no_fpn mode).
+        fpn_name_raw = fpn_cfg.get("name", None) if isinstance(fpn_cfg, dict) else None
+        fpn_name = fpn_name_raw.lower() if isinstance(fpn_name_raw, str) else None
+        self.use_fpn = fpn_name not in (None, "none", "identity")
 
-        # Stage-1 (/4) RNN output as decoder skip at /4 (FPN only feeds stages 2–4)
-        skip_quarter_ch = self.backbone.get_stage_dims((1,))[0]
-        self.depth_head = build_depth_head(
-            head_cfg, in_channels=in_channels, skip_quarter_channels=skip_quarter_ch
-        )
+        if self.use_fpn:
+            # FPN mode: PAFPN consumes selected stages; depth head gets FPN outputs
+            in_channels = self.backbone.get_stage_dims(tuple(fpn_cfg["in_stages"]))
+            self.fpn = build_yolox_fpn(fpn_cfg, in_channels=in_channels)
+            # Stage-1 (/4) RNN output as decoder skip at /4 (FPN only feeds stages 2–4)
+            skip_quarter_ch = self.backbone.get_stage_dims((1,))[0]
+            self.depth_head = build_depth_head(
+                head_cfg, in_channels=in_channels, skip_quarter_channels=skip_quarter_ch
+            )
+        else:
+            # No-FPN mode: depth head consumes all 4 backbone stages directly
+            self.fpn = None
+            in_channels = self.backbone.get_stage_dims((1, 2, 3, 4))
+            head_cfg = dict(head_cfg) if isinstance(head_cfg, dict) else {}
+            head_cfg.setdefault("mode", "no_fpn")
+            self.depth_head = build_depth_head(
+                head_cfg, in_channels=in_channels, skip_quarter_channels=None
+            )
 
         # Build loss function
         far_weight_cfg = loss_cfg.get("far_weight", {}) or {}
@@ -103,13 +119,17 @@ class DepthEstimator(th.nn.Module):
         """
         device = next(iter(backbone_features.values())).device
 
-        with CudaTimer(device=device, timer_name="FPN"):
-            fpn_features = self.fpn(backbone_features)
+        if self.use_fpn:
+            with CudaTimer(device=device, timer_name="FPN"):
+                fpn_features = self.fpn(backbone_features)
 
-        with CudaTimer(device=device, timer_name="Depth Head"):
-            predictions = self.depth_head(
-                fpn_features, feat_skip_quarter=backbone_features[1]
-            )
+            with CudaTimer(device=device, timer_name="Depth Head"):
+                predictions = self.depth_head(
+                    fpn_features, feat_skip_quarter=backbone_features[1]
+                )
+        else:
+            with CudaTimer(device=device, timer_name="Depth Head"):
+                predictions = self.depth_head(backbone_features)
 
         losses = None
         if targets is not None:
